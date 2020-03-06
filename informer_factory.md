@@ -39,6 +39,6 @@ type SharedInformerFactory interface {
 }
 ```
 
-4. 例如调用 informer.Core().V1().Pods().Informer()/informer.Core().V1().Pods().Lister(),看[informer_indexer.md](./informer_indexer.md)
+4. 例如调用 informer.Core().V1().Pods().Informer()/informer.Core().V1().Pods().Lister(),参考[informer_indexer.md](./informer_indexer.md)
 
 5. SharedInformerFactory是一个Informer工厂，可以获取不同版本的不同资源。
