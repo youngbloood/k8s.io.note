@@ -1,29 +1,370 @@
-# client-go下的cache.SharedInformer的数据流向
+# cache.SharedIndexInformer的深入了解
 
-## 一个cache.SharedIndexInformer的实现：
-- 构造函数：`NewSharedIndexInformer(lw ListerWatcher, objType runtime.Object, defaultEventHandlerResyncPeriod time.Duration, indexers Indexers)`
+## SharedInformerFactory接口
+位于k8s.io\client-go\tools\cache\shared_informer.go
+```
+// SharedInformerFactory provides shared informers for resources in all known
+// API group versions.
+type SharedInformerFactory interface {
+	internalinterfaces.SharedInformerFactory
+	ForResource(resource schema.GroupVersionResource) (GenericInformer, error)
+	WaitForCacheSync(stopCh <-chan struct{}) map[reflect.Type]bool
 
-  `lw：ListerWatcher`:是数据的来源处，通过http从数据源处获取数据
+	Admissionregistration() admissionregistration.Interface
+	Apps() apps.Interface
+	Auditregistration() auditregistration.Interface
+	Autoscaling() autoscaling.Interface
+	Batch() batch.Interface
+	Certificates() certificates.Interface
+	Coordination() coordination.Interface
+	Core() core.Interface
+	Discovery() discovery.Interface
+	Events() events.Interface
+	Extensions() extensions.Interface
+	Networking() networking.Interface
+	Node() node.Interface
+	Policy() policy.Interface
+	Rbac() rbac.Interface
+	Scheduling() scheduling.Interface
+	Settings() settings.Interface
+	Storage() storage.Interface
+}
+
+```
+internalinterfaces.SharedInformerFactory定义
+```
+// SharedInformerFactory a small interface to allow for adding an informer without an import cycle
+type SharedInformerFactory interface {
+	Start(stopCh <-chan struct{})
+	InformerFor(obj runtime.Object, newFunc NewInformerFunc) cache.SharedIndexInformer
+}
+```
+
+实现SharedInformerFactory接口的结构体`sharedInformerFactory`
+```
+type sharedInformerFactory struct {
+	client           kubernetes.Interface
+	namespace        string
+	tweakListOptions internalinterfaces.TweakListOptionsFunc
+	lock             sync.Mutex
+	defaultResync    time.Duration
+	customResync     map[reflect.Type]time.Duration
+
+	// 其中cache.SharedIndexInformer是本篇主要讲的内容，将会涉及到其数据流向
+	// 此map的值是通过InformerFor()函数将各种资源的informer注入进来的
+	informers map[reflect.Type]cache.SharedIndexInformer
+	// startedInformers is used for tracking which informers have been started.
+	// This allows Start() to be called multiple times safely.
+	startedInformers map[reflect.Type]bool
+}
+```
+
+## cache.SharedIndexInformer的定义
+```
+// SharedIndexInformer provides add and get Indexers ability based on SharedInformer.
+type SharedIndexInformer interface {
+	SharedInformer
+	// AddIndexers add indexers to the informer before it starts.
+	AddIndexers(indexers Indexers) error
+	GetIndexer() Indexer
+}
+```
+
+实现SharedIndexInformer接口的结构体`sharedIndexInformer`
+```
+type sharedIndexInformer struct {
+	// 本地缓存
+	indexer    Indexer
+	controller Controller
+	processor             *sharedProcessor
+	// 用于获取远程的资源
+	listerWatcher ListerWatcher
+	
+	// 省略部分字段
+}
+```
+
+cache包提供一个构造函数：`NewSharedIndexInformer(lw ListerWatcher, objType runtime.Object, defaultEventHandlerResyncPeriod time.Duration, indexers Indexers)`用来构造一个cache.SharedIndexInformer对象，其中：
+
+  - `lw：ListerWatcher`:是数据的来源处，通过http从数据源处获取数据
    
-   `objType`:是资源类型
+  - `objType`:是资源类型
 
-   `defaultEventHandlerResyncPeriod`:默认事件处理器重同步周期
+  - `defaultEventHandlerResyncPeriod`:默认事件处理器重同步周期
    
-   `indexers`:本地的indexer，用于构造一个 Indexer interface
+  - `indexers`:本地的indexer，用于构造一个 Indexer interface
 
-- 主要配置：包含一个indexer（本地缓存）和一个`listerwatcher`(用于获取远程的资源)，`processor *sharedProcessor`类型
 
-- 在`cache.SharedIndexInformer.Run(stop <-chan struct{})`时，创建一个`controller，controller`包含 一个`config`和一个`reflector`，`config`中包含如上2个主要配置，`Run()`驱动了informer从`ListerWatcher`中获取数据，并将数据改为event写入local cache中，最终交由注册如informer中的handler进行event的处理。
+## cache.SharedIndexInformer的数据来源
+sharedIndexInformer.Run(stopCh <-chan struct{})函数
+```
+func (s *sharedIndexInformer) Run(stopCh <-chan struct{}) {
+	defer utilruntime.HandleCrash()
+	// new一个fifo队列
+	fifo := NewDeltaFIFO(MetaNamespaceKeyFunc, s.indexer)
 
-- 执行`controller.Run(stop <-chan struct{})`时，创建一个`Reflector`，该`Reflector`包含一个store（local cache，即一个indexer）和`listerwather`，均为上面主要配置
+	cfg := &Config{
+		Queue:            fifo,
+		ListerWatcher:    s.listerWatcher,
+		ObjectType:       s.objectType,
+		FullResyncPeriod: s.resyncCheckPeriod,
+		RetryOnError:     false,
+		ShouldResync:     s.processor.shouldResync,
+		// 将sharedIndexInformer.HandleDeltas注入Config中；此方法用来消耗掉queue中接收到的数据
+		Process: s.HandleDeltas,
+	}
 
-- 执行`Reflector.Run(stop <-chan struct{})`，会根据相应的机制从`listerwatcher`中获得数据，不断add到store/indexer（local cache）中
+	func() {
+		s.startedLock.Lock()
+		defer s.startedLock.Unlock()
+		// new一个controller
+		s.controller = New(cfg)
+		s.controller.(*controller).clock = s.clock
+		s.started = true
+	}()
 
-- `controller.processLoop()`方法会循环从queue(store)中pop出元素，交由`cache.SharedIndexInformer.HandleDeltas(obj interface{})error`处理该元素，将该元素最终交由`processor.distribute()`进行处理
+	// Separate stop channel because Processor should be stopped strictly after controller
+	processorStopCh := make(chan struct{})
+	var wg wait.Group
+	defer wg.Wait()              // Wait for Processor to stop
+	defer close(processorStopCh) // Tell Processor to stop
+	wg.StartWithChannel(processorStopCh, s.cacheMutationDetector.Run)
+	wg.StartWithChannel(processorStopCh, s.processor.run)
 
-- `processor.distribute()`会写入`sharedProcessor`里的`listeners([]*processorListener)`和`syncingListeners([]*processorListener)`中，最终进入`listener`的`addCh chan interface{}`中，由`processorListener.pop()`函数取出并包装放`入nextCh chan interface{}`中，由`processorListener.run()`函数从`nextCh`中取出，交由下一步的handler进行处理。
+	defer func() {
+		s.startedLock.Lock()
+		defer s.startedLock.Unlock()
+		s.stopped = true // Don't want any new listeners
+	}()
 
-- `cache.SharedIndexInformer.AddEventHandler(handler ResourceEventHandler)`会注册handler在`SharedInformer`中，该handler就是上一步中的handler接收器，专门处理`nextCh`中收到的事件
+	// 执行controller的Run()函数
+	s.controller.Run(stopCh)
+}
+```
+跳转到`New(cfg)`，位于`k8s.io\client-go\tools\cache\controller.go`中
+```
+// New makes a new Controller from the given Config.
+func New(c *Config) Controller {
+	ctlr := &controller{
+		config: *c,
+		clock:  &clock.RealClock{},
+	}
+	return ctlr
+}
+```
+Controller接口
+```
+// Controller is a generic controller framework.
+type Controller interface {
+	Run(stopCh <-chan struct{})
+	HasSynced() bool
+	LastSyncResourceVersion() string
+}
+```
+
+controller.Run()函数
+```
+func (c *controller) Run(stopCh <-chan struct{}) {
+	defer utilruntime.HandleCrash()
+	go func() {
+		<-stopCh
+		c.config.Queue.Close()
+	}()
+	// 创建一个reflector
+	r := NewReflector(
+		c.config.ListerWatcher,
+		c.config.ObjectType,
+		c.config.Queue,
+		c.config.FullResyncPeriod,
+	)
+	r.ShouldResync = c.config.ShouldResync
+	r.clock = c.clock
+
+	c.reflectorMutex.Lock()
+	c.reflector = r
+	c.reflectorMutex.Unlock()
+
+	var wg wait.Group
+	defer wg.Wait()
+	// reflector.Run()函数，此处就是数据的流入口
+	wg.StartWithChannel(stopCh, r.Run)
+	// 调用controller.processLoop()函数，此处是数据的流出口
+	wait.Until(c.processLoop, time.Second, stopCh)
+}
+```
+
+reflector.Run()函数
+```
+// Run starts a watch and handles watch events. Will restart the watch if it is closed.
+// Run will exit when stopCh is closed.
+func (r *Reflector) Run(stopCh <-chan struct{}) {
+	klog.V(3).Infof("Starting reflector %v (%s) from %s", r.expectedTypeName, r.resyncPeriod, r.name)
+	wait.Until(func() {
+		// 此方法太长，不贴源码，功能：不断从`listerwatcher`中获取数据，存入store中，这个store实质为一个queue，再创建controller的时候创建的
+		if err := r.ListAndWatch(stopCh); err != nil {
+			utilruntime.HandleError(err)
+		}
+	}, r.period, stopCh)
+}
+
+```
+
+## cache.SharedIndexInformer的数据去向
+controller.processLoop()函数
+```
+func (c *controller) processLoop() {
+	for {
+		// 将c.config.Process转化为PopProcessFunc方法，不断消耗掉queue中Pop出的数据
+		obj, err := c.config.Queue.Pop(PopProcessFunc(c.config.Process))
+		// ...
+	}
+}
+```
+
+有上面的代码可知，c.config.Process本质就是`sharedIndexInformer.HandleDeltas`方法
+
+sharedIndexInformer.HandleDeltas()函数
+
+```
+
+func (s *sharedIndexInformer) HandleDeltas(obj interface{}) error {
+	s.blockDeltas.Lock()
+	defer s.blockDeltas.Unlock()
+
+	// from oldest to newest
+	for _, d := range obj.(Deltas) {
+		switch d.Type {
+		case Sync, Added, Updated:
+			isSync := d.Type == Sync
+			s.cacheMutationDetector.AddObject(d.Object)
+			if old, exists, err := s.indexer.Get(d.Object); err == nil && exists {
+				if err := s.indexer.Update(d.Object); err != nil {
+					return err
+				}
+				// 交由distribute处理
+				s.processor.distribute(updateNotification{oldObj: old, newObj: d.Object}, isSync)
+			} else {
+				if err := s.indexer.Add(d.Object); err != nil {
+					return err
+				}
+				// 交由distribute处理
+				s.processor.distribute(addNotification{newObj: d.Object}, isSync)
+			}
+		case Deleted:
+			if err := s.indexer.Delete(d.Object); err != nil {
+				return err
+			}
+			// 交由distribute处理
+			s.processor.distribute(deleteNotification{oldObj: d.Object}, false)
+		}
+	}
+	return nil
+}
+```
+
+processor.distribute()函数
+
+```
+func (p *sharedProcessor) distribute(obj interface{}, sync bool) {
+	p.listenersLock.RLock()
+	defer p.listenersLock.RUnlock()
+
+	if sync {
+		// 分发到其下的listener中
+		for _, listener := range p.syncingListeners {
+			listener.add(obj)
+		}
+	} else {
+		// 分发到其下的listener中
+		for _, listener := range p.listeners {
+			listener.add(obj)
+		}
+	}
+}
+```
+
+由processor.pop()函数将上步的obj取出来放入nextCh中
+```
+func (p *processorListener) pop() {
+	defer utilruntime.HandleCrash()
+	defer close(p.nextCh) // Tell .run() to stop
+
+	var nextCh chan<- interface{}
+	var notification interface{}
+	for {
+		select {
+			// 写入nextCh
+		case nextCh <- notification:
+			// Notification dispatched
+			var ok bool
+			notification, ok = p.pendingNotifications.ReadOne()
+			if !ok { // Nothing to pop
+				nextCh = nil // Disable this select case
+			}
+		case notificationToAdd, ok := <-p.addCh:
+			if !ok {
+				return
+			}
+			if notification == nil { // No notification to pop (and pendingNotifications is empty)
+				// 跳过放入pending中，直接放入nextCh中
+				notification = notificationToAdd
+				nextCh = p.nextCh
+			} else { 
+				// 放入pending中，缓冲
+				p.pendingNotifications.WriteOne(notificationToAdd)
+			}
+		}
+	}
+}
+```
+
+最后，由processor.run()函数从nextCh或pending中取出来
+```
+func (p *processorListener) run() {
+	// this call blocks until the channel is closed.  When a panic happens during the notification
+	// we will catch it, **the offending item will be skipped!**, and after a short delay (one second)
+	// the next notification will be attempted.  This is usually better than the alternative of never
+	// delivering again.
+	stopCh := make(chan struct{})
+	wait.Until(func() {
+		// this gives us a few quick retries before a long pause and then a few more quick retries
+		err := wait.ExponentialBackoff(retry.DefaultRetry, func() (bool, error) {
+			// 从nextCh中取出，由handler进行下一步处理
+			for next := range p.nextCh {
+				switch notification := next.(type) {
+				case updateNotification:
+					p.handler.OnUpdate(notification.oldObj, notification.newObj)
+				case addNotification:
+					p.handler.OnAdd(notification.newObj)
+				case deleteNotification:
+					p.handler.OnDelete(notification.oldObj)
+				default:
+					utilruntime.HandleError(fmt.Errorf("unrecognized notification: %T", next))
+				}
+			}
+			// the only way to get here is if the p.nextCh is empty and closed
+			return true, nil
+		})
+
+		// the only way to get here is if the p.nextCh is empty and closed
+		if err == nil {
+			close(stopCh)
+		}
+	}, 1*time.Minute, stopCh)
+}
+```
+
+`cache.SharedIndexInformer.AddEventHandler(handler ResourceEventHandler)`会注册handler在`SharedInformer`中，该handler就是上一步中的handler接收器，专门处理`nextCh`中收到的事件
+
+最后，obj被注册的ResourceEventHandler的方法消耗掉。
+
+
+# 总结
+- 调用NewSharedIndexInformer(lw ListerWatcher,...)方法new一个`SharedIndexInformer`时，lw就是该SharedIndexInformer监听数据的来源。
+- SharedIndexInformer.AddEventHandler(handler ResourceEventHandler)方法会注册一个`ResourceEventHandler`，这个handler最终会处理掉从lw中缓存下来的所有数据。
+
+
+
 
 ## 类Informer的一些其他细节
 
@@ -95,3 +436,4 @@ func (f *replicaSetInformer) Lister() v1.ReplicaSetLister {
 - 在调用`Informer()`时，会直接从f.factory的缓存中取出`cache.SharedIndexInformer`，如果f.factory中没有，则调用`f.defaultInformer`初始化一个`cache.SharedIndexInfomer`并返回。
 
 - 在调用`Lister()`时，会调用`f.Informer().GetIndexer()`，该函数返回的是local cache的数据。所以`Lister()`是从local cache中获取到的数据
+
