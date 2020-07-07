@@ -6,6 +6,7 @@
 // SharedInformerFactory provides shared informers for resources in all known
 // API group versions.
 type SharedInformerFactory interface {
+	// 此处内嵌internalinterfaces.SharedInformerFactory
 	internalinterfaces.SharedInformerFactory
 	ForResource(resource schema.GroupVersionResource) (GenericInformer, error)
 	WaitForCacheSync(stopCh <-chan struct{}) map[reflect.Type]bool
@@ -43,18 +44,14 @@ type SharedInformerFactory interface {
 实现SharedInformerFactory接口的结构体`sharedInformerFactory`
 ```
 type sharedInformerFactory struct {
-	client           kubernetes.Interface
-	namespace        string
-	tweakListOptions internalinterfaces.TweakListOptionsFunc
-	lock             sync.Mutex
-	defaultResync    time.Duration
-	customResync     map[reflect.Type]time.Duration
+	
+	// ...
 
 	// 其中cache.SharedIndexInformer是本篇主要讲的内容，将会涉及到其数据流向
 	// 此map的值是通过InformerFor()函数将各种资源的informer注入进来的
 	informers map[reflect.Type]cache.SharedIndexInformer
-	// startedInformers is used for tracking which informers have been started.
-	// This allows Start() to be called multiple times safely.
+	
+	// 记录开启了的informer
 	startedInformers map[reflect.Type]bool
 }
 ```
@@ -67,6 +64,37 @@ type SharedIndexInformer interface {
 	// AddIndexers add indexers to the informer before it starts.
 	AddIndexers(indexers Indexers) error
 	GetIndexer() Indexer
+}
+```
+
+SharedInformer的定义
+```
+type SharedInformer interface {
+	// AddEventHandler adds an event handler to the shared informer using the shared informer's resync
+	// period.  Events to a single handler are delivered sequentially, but there is no coordination
+	// between different handlers.
+	AddEventHandler(handler ResourceEventHandler)
+	// AddEventHandlerWithResyncPeriod adds an event handler to the
+	// shared informer using the specified resync period.  The resync
+	// operation consists of delivering to the handler a create
+	// notification for every object in the informer's local cache; it
+	// does not add any interactions with the authoritative storage.
+	AddEventHandlerWithResyncPeriod(handler ResourceEventHandler, resyncPeriod time.Duration)
+	// GetStore returns the informer's local cache as a Store.
+	GetStore() Store
+	// GetController gives back a synthetic interface that "votes" to start the informer
+	GetController() Controller
+	// Run starts and runs the shared informer, returning after it stops.
+	// The informer will be stopped when stopCh is closed.
+	Run(stopCh <-chan struct{})
+	// HasSynced returns true if the shared informer's store has been
+	// informed by at least one full LIST of the authoritative state
+	// of the informer's object collection.  This is unrelated to "resync".
+	HasSynced() bool
+	// LastSyncResourceVersion is the resource version observed when last synced with the underlying
+	// store. The value returned is not synchronized with access to the underlying store and is not
+	// thread-safe.
+	LastSyncResourceVersion() string
 }
 ```
 
@@ -366,7 +394,7 @@ func (p *processorListener) run() {
 
 
 
-## 类Informer的一些其他细节
+## 附：k8s.io/client-go/informers/<resource>/<version>下的Informer的一些其他细节
 
 - 以`replicaset`为例
 1. 代码位置`k8s.io/client-go/informers/app/v1/replicaset.go:36`
@@ -433,7 +461,9 @@ func (f *replicaSetInformer) Lister() v1.ReplicaSetLister {
 }
 
 ```
+
+- 此类resource下的informer是围绕`cache.SharedIndexInfomer`和`internalinterfaces.SharedInformerFactory`两个接口进行设计的。
 - 在调用`Informer()`时，会直接从f.factory的缓存中取出`cache.SharedIndexInformer`，如果f.factory中没有，则调用`f.defaultInformer`初始化一个`cache.SharedIndexInfomer`并返回。
 
-- 在调用`Lister()`时，会调用`f.Informer().GetIndexer()`，该函数返回的是local cache的数据。所以`Lister()`是从local cache中获取到的数据
+- 在调用`Lister()`时，会调用`f.Informer().GetIndexer()`，该函数返回的是local cache的数据。所以`Lister()`是从local cache中获取到的数据。
 
