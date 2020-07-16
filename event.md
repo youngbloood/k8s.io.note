@@ -1,3 +1,9 @@
+# Event
+
+## 前言
+- event的详细定义见k8s.io\api\core\v1\types.go
+- event表示集群中对一些事件的报告
+
 ## 关于event的一些实现细节，此处以kube-controller-manager中的replicaset为例
 
 > 1. 本章看完会event在EventBroadcaster中的数据流向
