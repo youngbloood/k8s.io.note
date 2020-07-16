@@ -7,7 +7,7 @@
 
 ## operator-project项目
   一个operator-project项目目录如下：
-
+```
   <operator-name>
     ├─build             // 存放一些编译后的二进制文件
     │  └─bin
@@ -21,12 +21,13 @@
     ├─pkg               // pkg包含自己需要定制的api和controller
     │  ├─apis           // 自定义api
     │  │  └─cache
-    │  │      └─v1alpha1
+    │  │      └─v1alpha1// 定义的api版本
     │  └─controller     // 自定义controller，用户处理自定义api或k8s已有的api
-    │      └─memcached
+    │      └─memcached	// 定义的controller名称
     ├─test         
-    │  └─e2e
+    │  └─e2e			// end-to-end测试
     └─version
+````
       
 ## operator-project项目源码
  > 此处使用[operator-sdk-samples](https://github.com/operator-framework/operator-sdk-samples/tree/master/go/memcached-operator)为例展示源码
